@@ -37,7 +37,7 @@ async function startServer() {
     };
 
     try {
-      const result = await handleApiRequest(apiReq);
+      const result = await handleApiRequest(apiReq, process.env);
       if (result.headers) {
         for (const [hk, hv] of Object.entries(result.headers)) {
           res.setHeader(hk, hv);

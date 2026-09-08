@@ -317,6 +317,7 @@ export interface AdminStats {
 
 export interface SearchFilterParams {
   q?: string;
+  query?: string;
   search?: string;
   category?: string;
   categorySlug?: string;

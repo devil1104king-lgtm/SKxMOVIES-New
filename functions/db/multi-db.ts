@@ -42,45 +42,65 @@ export function generateSlug(text: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
+/**
+ * MultiDbManager: Multi-Database PostgreSQL / CockroachDB Manager
+ * Optimized for Cloudflare Pages Functions and edge environments.
+ */
 export class MultiDbManager {
   private connections: DatabaseConnection[] = [];
   private activeWriteIndex = 1;
-  private localData = {
+  private isInitialized = false;
+  private initPromise: Promise<void> | null = null;
+  private currentEnv: Record<string, any> = {};
+
+  // In-memory fallback used ONLY during local development when no database is configured
+  private localDevData = {
     settings: { ...INITIAL_SETTINGS },
     categories: [...INITIAL_CATEGORIES],
     genres: [...INITIAL_GENRES],
     tags: [...INITIAL_TAGS],
     content: [...INITIAL_CONTENT],
     popups: [...INITIAL_POPUPS],
-    adminUsers: [
-      {
-        id: 'admin-master',
-        email: process.env.ADMIN_EMAIL || 'admin@skxmovies.com',
-        name: 'SKx Movies Chief Admin',
-        role: 'superadmin' as const,
-        passwordHash: bcrypt.hashSync(process.env.ADMIN_PASSWORD || 'Admin@skxmovies2026', 10),
-        createdAt: new Date().toISOString()
-      }
-    ]
+    adminUsers: [] as Array<{
+      id: string;
+      email: string;
+      name: string;
+      role: 'superadmin';
+      passwordHash: string;
+      createdAt: string;
+    }>
   };
-  private isInitialized = false;
 
   constructor() {
-    this.discoverDatabases();
+    this.discoverDatabases(typeof process !== 'undefined' ? process.env : {});
+  }
+
+  public isProduction(): boolean {
+    const env = this.currentEnv;
+    const nodeEnv = env.NODE_ENV || (typeof process !== 'undefined' ? process.env?.NODE_ENV : '');
+    const environment = env.ENVIRONMENT || (typeof process !== 'undefined' ? process.env?.ENVIRONMENT : '');
+    return nodeEnv === 'production' || environment === 'production';
+  }
+
+  public hasRealDatabases(): boolean {
+    return this.connections.some(c => c.status !== 'simulated' && c.url && !c.url.startsWith('memory://'));
   }
 
   /**
-   * Scan environment variables for DATABASE_URL, DATABASE_URL_2, DATABASE_URL_3, etc.
+   * Scan environment for DATABASE_URL, DATABASE_URL_2 ... DATABASE_URL_10 and HYPERDRIVE
    */
-  public discoverDatabases(envSource: Record<string, string | undefined> = process.env) {
+  public discoverDatabases(envSource: Record<string, any> = {}) {
+    this.currentEnv = envSource;
     const discovered: DatabaseConnection[] = [];
 
-    // Check DATABASE_URL (Index 1)
-    const primaryUrl = envSource.DATABASE_URL?.trim();
+    // 1. Check Cloudflare Hyperdrive binding first if available
+    const hyperdriveUrl = envSource.HYPERDRIVE?.connectionString;
+    const primaryUrl = (hyperdriveUrl || envSource.DATABASE_URL || (typeof process !== 'undefined' ? process.env?.DATABASE_URL : ''))?.trim();
+
     if (primaryUrl) {
       discovered.push({
         index: 1,
-        envKey: 'DATABASE_URL',
+        envKey: hyperdriveUrl ? 'HYPERDRIVE (Primary)' : 'DATABASE_URL',
         url: primaryUrl,
         pool: null,
         isWriteActive: false,
@@ -88,10 +108,10 @@ export class MultiDbManager {
       });
     }
 
-    // Check DATABASE_URL_2 through DATABASE_URL_10
+    // 2. Check DATABASE_URL_2 through DATABASE_URL_10
     for (let i = 2; i <= 10; i++) {
       const key = `DATABASE_URL_${i}`;
-      const url = envSource[key]?.trim();
+      const url = (envSource[key] || (typeof process !== 'undefined' ? process.env?.[key] : ''))?.trim();
       if (url) {
         discovered.push({
           index: i,
@@ -104,12 +124,15 @@ export class MultiDbManager {
       }
     }
 
-    // If no databases configured in env, maintain 1 simulated in-memory connection
+    // If no real databases configured:
     if (discovered.length === 0) {
+      if (this.isProduction()) {
+        console.error('[MultiDbManager] ERROR: No DATABASE_URL configured in production environment!');
+      }
       discovered.push({
         index: 1,
-        envKey: 'DATABASE_URL (Local / Simulated)',
-        url: 'memory://skxmovies-local',
+        envKey: 'DATABASE_URL (Local Dev Memory)',
+        url: 'memory://skxmovies-local-dev',
         pool: null,
         isWriteActive: true,
         status: 'simulated'
@@ -119,26 +142,26 @@ export class MultiDbManager {
       return;
     }
 
-    // The highest index is marked as the active write database
+    // Mark the highest index as active write database
     discovered.sort((a, b) => a.index - b.index);
     const highest = discovered[discovered.length - 1];
     highest.isWriteActive = true;
     this.activeWriteIndex = highest.index;
 
-    // Initialize Pools
+    // Initialize Pools with connection parameters optimized for serverless / edge
     for (const conn of discovered) {
       try {
         const pool = new Pool({
           connectionString: conn.url,
           ssl: conn.url.includes('localhost') ? false : { rejectUnauthorized: false },
-          max: 10,
-          idleTimeoutMillis: 30000,
-          connectionTimeoutMillis: 5000
+          max: 5,
+          idleTimeoutMillis: 10000,
+          connectionTimeoutMillis: 6000
         });
         conn.pool = pool;
         conn.status = 'connected';
       } catch (err) {
-        console.warn(`[MultiDbManager] Warning: failed to init pool for ${conn.envKey}:`, err);
+        console.warn(`[MultiDbManager] Warning: failed to initialize pool for ${conn.envKey}:`, err);
         conn.status = 'unreachable';
       }
     }
@@ -147,117 +170,125 @@ export class MultiDbManager {
   }
 
   /**
-   * Bootstrap CockroachDB / PostgreSQL tables if live pools exist
+   * Idempotent table creation with concurrency-safe lock
    */
-  public async init() {
+  public async init(): Promise<void> {
     if (this.isInitialized) return;
-    this.isInitialized = true;
+    if (this.initPromise) return this.initPromise;
 
-    for (const conn of this.connections) {
-      if (!conn.pool) continue;
-      try {
-        await conn.pool.query(`
-          CREATE TABLE IF NOT EXISTS categories (
-            id VARCHAR(64) PRIMARY KEY,
-            name VARCHAR(255) NOT NULL,
-            slug VARCHAR(255) UNIQUE NOT NULL,
-            description TEXT,
-            image_url TEXT,
-            display_order INT DEFAULT 0,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS genres (
-            id VARCHAR(64) PRIMARY KEY,
-            name VARCHAR(128) NOT NULL,
-            slug VARCHAR(128) UNIQUE NOT NULL,
-            description TEXT,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS tags (
-            id VARCHAR(64) PRIMARY KEY,
-            name VARCHAR(128) NOT NULL,
-            slug VARCHAR(128) UNIQUE NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS content (
-            id VARCHAR(64) PRIMARY KEY,
-            title VARCHAR(512) NOT NULL,
-            slug VARCHAR(512) UNIQUE NOT NULL,
-            description TEXT NOT NULL,
-            poster_url TEXT NOT NULL,
-            backdrop_url TEXT,
-            category_id VARCHAR(64),
-            category_name VARCHAR(255),
-            category_slug VARCHAR(255),
-            genres JSONB DEFAULT '[]'::jsonb,
-            tags JSONB DEFAULT '[]'::jsonb,
-            release_date VARCHAR(64),
-            duration VARCHAR(64),
-            rating VARCHAR(64),
-            language VARCHAR(128),
-            featured BOOLEAN DEFAULT FALSE,
-            status VARCHAR(32) DEFAULT 'published',
-            trailer_url TEXT,
-            views INT DEFAULT 0,
-            db_source VARCHAR(64),
-            tutorial_title TEXT,
-            tutorial_url TEXT,
-            tutorial_thumbnail TEXT,
-            how_to_access_title TEXT,
-            how_to_access_instructions TEXT,
-            how_to_access_steps JSONB DEFAULT '[]'::jsonb,
-            access_options JSONB DEFAULT '[]'::jsonb,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS popups (
-            id VARCHAR(64) PRIMARY KEY,
-            title VARCHAR(255) NOT NULL,
-            message TEXT NOT NULL,
-            btn1_text VARCHAR(128),
-            btn1_url TEXT,
-            btn1_enabled BOOLEAN DEFAULT TRUE,
-            btn2_text VARCHAR(128),
-            btn2_url TEXT,
-            btn2_enabled BOOLEAN DEFAULT FALSE,
-            bg_image_url TEXT,
-            type VARCHAR(32) DEFAULT 'announcement',
-            position VARCHAR(32) DEFAULT 'center',
-            frequency VARCHAR(32) DEFAULT 'once_per_session',
-            delay_seconds INT DEFAULT 2,
-            show_on VARCHAR(32) DEFAULT 'all',
-            page_paths TEXT,
-            start_date TIMESTAMPTZ,
-            end_date TIMESTAMPTZ,
-            active BOOLEAN DEFAULT TRUE,
-            priority INT DEFAULT 1,
-            show_close_btn BOOLEAN DEFAULT TRUE,
-            show_overlay BOOLEAN DEFAULT TRUE,
-            close_on_overlay BOOLEAN DEFAULT TRUE,
-            cooldown_enabled BOOLEAN DEFAULT FALSE,
-            cooldown_hours INT DEFAULT 24,
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS site_settings (
-            id VARCHAR(64) PRIMARY KEY,
-            data JSONB NOT NULL,
-            updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-          CREATE TABLE IF NOT EXISTS admin_users (
-            id VARCHAR(64) PRIMARY KEY,
-            email VARCHAR(255) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL,
-            name VARCHAR(255) NOT NULL,
-            role VARCHAR(64) DEFAULT 'superadmin',
-            created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-          );
-        `);
-        conn.status = 'connected';
-      } catch (err) {
-        console.warn(`[MultiDbManager] Warning initializing tables on ${conn.envKey}:`, err);
+    this.initPromise = (async () => {
+      for (const conn of this.connections) {
+        if (!conn.pool) continue;
+        try {
+          await conn.pool.query(`
+            CREATE TABLE IF NOT EXISTS categories (
+              id VARCHAR(64) PRIMARY KEY,
+              name VARCHAR(255) NOT NULL,
+              slug VARCHAR(255) UNIQUE NOT NULL,
+              description TEXT,
+              image_url TEXT,
+              display_order INT DEFAULT 0,
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS genres (
+              id VARCHAR(64) PRIMARY KEY,
+              name VARCHAR(128) NOT NULL,
+              slug VARCHAR(128) UNIQUE NOT NULL,
+              description TEXT,
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS tags (
+              id VARCHAR(64) PRIMARY KEY,
+              name VARCHAR(128) NOT NULL,
+              slug VARCHAR(128) UNIQUE NOT NULL,
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS content (
+              id VARCHAR(64) PRIMARY KEY,
+              title VARCHAR(512) NOT NULL,
+              slug VARCHAR(512) UNIQUE NOT NULL,
+              description TEXT NOT NULL,
+              poster_url TEXT NOT NULL,
+              backdrop_url TEXT,
+              category_id VARCHAR(64),
+              category_name VARCHAR(255),
+              category_slug VARCHAR(255),
+              genres JSONB DEFAULT '[]'::jsonb,
+              tags JSONB DEFAULT '[]'::jsonb,
+              release_date VARCHAR(64),
+              duration VARCHAR(64),
+              rating VARCHAR(64),
+              language VARCHAR(128),
+              featured BOOLEAN DEFAULT FALSE,
+              status VARCHAR(32) DEFAULT 'published',
+              trailer_url TEXT,
+              views INT DEFAULT 0,
+              db_source VARCHAR(64),
+              tutorial_title TEXT,
+              tutorial_url TEXT,
+              tutorial_thumbnail TEXT,
+              how_to_access_title TEXT,
+              how_to_access_instructions TEXT,
+              how_to_access_steps JSONB DEFAULT '[]'::jsonb,
+              access_options JSONB DEFAULT '[]'::jsonb,
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+              updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS popups (
+              id VARCHAR(64) PRIMARY KEY,
+              title VARCHAR(255) NOT NULL,
+              message TEXT NOT NULL,
+              btn1_text VARCHAR(128),
+              btn1_url TEXT,
+              btn1_enabled BOOLEAN DEFAULT TRUE,
+              btn2_text VARCHAR(128),
+              btn2_url TEXT,
+              btn2_enabled BOOLEAN DEFAULT FALSE,
+              bg_image_url TEXT,
+              type VARCHAR(32) DEFAULT 'announcement',
+              position VARCHAR(32) DEFAULT 'center',
+              frequency VARCHAR(32) DEFAULT 'once_per_session',
+              delay_seconds INT DEFAULT 2,
+              show_on VARCHAR(32) DEFAULT 'all',
+              page_paths TEXT,
+              start_date TIMESTAMPTZ,
+              end_date TIMESTAMPTZ,
+              active BOOLEAN DEFAULT TRUE,
+              priority INT DEFAULT 1,
+              show_close_btn BOOLEAN DEFAULT TRUE,
+              show_overlay BOOLEAN DEFAULT TRUE,
+              close_on_overlay BOOLEAN DEFAULT TRUE,
+              cooldown_enabled BOOLEAN DEFAULT FALSE,
+              cooldown_hours INT DEFAULT 24,
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+              updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS site_settings (
+              id VARCHAR(64) PRIMARY KEY,
+              data JSONB NOT NULL,
+              updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS admin_users (
+              id VARCHAR(64) PRIMARY KEY,
+              email VARCHAR(255) UNIQUE NOT NULL,
+              password_hash VARCHAR(255) NOT NULL,
+              name VARCHAR(255) NOT NULL,
+              role VARCHAR(64) DEFAULT 'superadmin',
+              created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+          `);
+          conn.status = 'connected';
+        } catch (err) {
+          console.error(`[MultiDbManager] Error initializing schema on ${conn.envKey}:`, err);
+          if (this.isProduction()) {
+            throw new Error(`Database initialization failed on ${conn.envKey}: ${(err as Error).message}`);
+          }
+        }
       }
-    }
+      this.isInitialized = true;
+    })();
+
+    return this.initPromise;
   }
 
   public getDbStatus(): MultiDbStatus {
@@ -282,29 +313,44 @@ export class MultiDbManager {
   // ==========================================
 
   public async getAllContent(params: SearchFilterParams = {}): Promise<PaginatedResult<ContentItem>> {
-    let allItems: ContentItem[] = [];
-    let usedLiveDb = false;
+    const realConns = this.connections.filter(c => c.pool && c.status === 'connected');
 
-    // 1. Read across all connected databases
-    for (const conn of this.connections) {
-      if (conn.pool && conn.status === 'connected') {
+    if (realConns.length > 0) {
+      const allItems: ContentItem[] = [];
+      let anySucceeded = false;
+      let lastError: any = null;
+
+      for (const conn of realConns) {
         try {
-          const res = await conn.pool.query(`SELECT * FROM content ORDER BY created_at DESC`);
-          const items: ContentItem[] = res.rows.map(row => this.mapContentRow(row, conn.envKey));
+          const res = await conn.pool!.query(`SELECT * FROM content ORDER BY created_at DESC`);
+          const items = res.rows.map(row => this.mapContentRow(row, conn.envKey));
           allItems.push(...items);
-          usedLiveDb = true;
-        } catch (e) {
-          console.warn(`[MultiDbManager] Query failed on ${conn.envKey}:`, e);
+          anySucceeded = true;
+        } catch (err) {
+          lastError = err;
+          console.error(`[MultiDbManager] Error querying content on ${conn.envKey}:`, err);
         }
+      }
+
+      if (!anySucceeded && this.isProduction()) {
+        throw new Error(`Database query failed on all connections: ${lastError?.message || 'Unknown database error'}`);
+      }
+
+      if (anySucceeded) {
+        return this.filterAndPaginateContent(allItems, params);
       }
     }
 
-    // 2. If no live DB results or in local simulated mode, use localData
-    if (!usedLiveDb) {
-      allItems = [...this.localData.content];
+    // In production without live databases, fail explicitly
+    if (this.isProduction()) {
+      throw new Error('Database unavailable. Please check your DATABASE_URL configuration.');
     }
 
-    // 3. Deduplicate by ID
+    // Local dev mode fallback
+    return this.filterAndPaginateContent(this.localDevData.content, params);
+  }
+
+  private filterAndPaginateContent(allItems: ContentItem[], params: SearchFilterParams): PaginatedResult<ContentItem> {
     const map = new Map<string, ContentItem>();
     for (const item of allItems) {
       if (!map.has(item.id)) {
@@ -313,7 +359,6 @@ export class MultiDbManager {
     }
     let list = Array.from(map.values());
 
-    // 4. Filter
     if (params.status && params.status !== 'all') {
       list = list.filter(c => c.status === params.status);
     } else if (!params.status) {
@@ -340,20 +385,19 @@ export class MultiDbManager {
     }
 
     if (params.featured !== undefined) {
-      list = list.filter(c => c.featured === params.featured);
+      list = list.filter(c => c.featured === Boolean(params.featured));
     }
 
-    if (params.q) {
-      const q = params.q.toLowerCase().trim();
+    const searchKeyword = (params.q || params.search || params.query || '').toLowerCase().trim();
+    if (searchKeyword) {
       list = list.filter(c =>
-        c.title.toLowerCase().includes(q) ||
-        c.description.toLowerCase().includes(q) ||
-        c.genres.some(g => g.toLowerCase().includes(q)) ||
-        c.tags.some(t => t.toLowerCase().includes(q))
+        c.title.toLowerCase().includes(searchKeyword) ||
+        c.description.toLowerCase().includes(searchKeyword) ||
+        c.genres.some(g => g.toLowerCase().includes(searchKeyword)) ||
+        c.tags.some(t => t.toLowerCase().includes(searchKeyword))
       );
     }
 
-    // 5. Sort
     const sortBy = params.sortBy || 'createdAt';
     const sortOrder = params.sortOrder || 'desc';
 
@@ -377,7 +421,6 @@ export class MultiDbManager {
       return 0;
     });
 
-    // 6. Pagination
     const page = Math.max(1, Number(params.page) || 1);
     const limit = Math.max(1, Number(params.limit) || 24);
     const total = list.length;
@@ -396,9 +439,8 @@ export class MultiDbManager {
 
   public async getContentBySlug(slug: string, incrementViews = false): Promise<ContentItem | null> {
     const cleanSlug = slug.toLowerCase().trim();
-
-    // Search live DBs in descending order (newest first)
     const reversed = [...this.connections].reverse();
+
     for (const conn of reversed) {
       if (conn.pool && conn.status === 'connected') {
         try {
@@ -412,19 +454,20 @@ export class MultiDbManager {
             return item;
           }
         } catch (e) {
-          console.warn(`[MultiDbManager] Search by slug failed on ${conn.envKey}:`, e);
+          console.error(`[MultiDbManager] Search by slug failed on ${conn.envKey}:`, e);
+          if (this.isProduction()) throw e;
         }
       }
     }
 
-    // Fallback to local
-    const local = this.localData.content.find(c => c.slug.toLowerCase() === cleanSlug);
-    if (local) {
-      if (incrementViews) {
-        local.views = (local.views || 0) + 1;
+    if (!this.hasRealDatabases()) {
+      const local = this.localDevData.content.find(c => c.slug.toLowerCase() === cleanSlug);
+      if (local) {
+        if (incrementViews) local.views = (local.views || 0) + 1;
+        return { ...local };
       }
-      return { ...local };
     }
+
     return null;
   }
 
@@ -437,23 +480,25 @@ export class MultiDbManager {
             return this.mapContentRow(res.rows[0], conn.envKey);
           }
         } catch (e) {
-          console.warn(`[MultiDbManager] Search by id failed on ${conn.envKey}:`, e);
+          console.error(`[MultiDbManager] Search by id failed on ${conn.envKey}:`, e);
+          if (this.isProduction()) throw e;
         }
       }
     }
-    const local = this.localData.content.find(c => c.id === id);
-    return local ? { ...local } : null;
+
+    if (!this.hasRealDatabases()) {
+      const local = this.localDevData.content.find(c => c.id === id);
+      return local ? { ...local } : null;
+    }
+
+    return null;
   }
 
-  /**
-   * CREATE CONTENT: Always writes to the newest active write database
-   */
   public async createContent(input: Omit<ContentItem, 'id' | 'createdAt' | 'updatedAt' | 'views'>): Promise<ContentItem> {
     const now = new Date().toISOString();
     const id = 'mov-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
     const slug = input.slug ? generateSlug(input.slug) : generateSlug(input.title);
 
-    // Identify active write connection
     const writeConn = this.connections.find(c => c.isWriteActive) || this.connections[this.connections.length - 1];
     const dbSource = writeConn ? writeConn.envKey : 'DATABASE_URL';
 
@@ -467,10 +512,6 @@ export class MultiDbManager {
       updatedAt: now
     };
 
-    // Save to local cache
-    this.localData.content.unshift(newItem);
-
-    // Write to active CockroachDB / Postgres database
     if (writeConn && writeConn.pool && writeConn.status === 'connected') {
       try {
         await writeConn.pool.query(`
@@ -494,20 +535,23 @@ export class MultiDbManager {
           JSON.stringify(newItem.howToAccessSteps || []), JSON.stringify(newItem.accessOptions || []),
           new Date(newItem.createdAt), new Date(newItem.updatedAt)
         ]);
+        return newItem;
       } catch (err) {
         console.error(`[MultiDbManager] Error inserting content into ${writeConn.envKey}:`, err);
+        throw err;
       }
     }
 
+    if (this.isProduction()) {
+      throw new Error('Cannot create content: No database connection available.');
+    }
+
+    this.localDevData.content.unshift(newItem);
     return newItem;
   }
 
-  /**
-   * UPDATE CONTENT: Updates in the database where it was found
-   */
   public async updateContent(id: string, updates: Partial<ContentItem>): Promise<ContentItem | null> {
-    const existingIndex = this.localData.content.findIndex(c => c.id === id);
-    const existing = existingIndex !== -1 ? this.localData.content[existingIndex] : await this.getContentById(id);
+    const existing = await this.getContentById(id);
     if (!existing) return null;
 
     const updated: ContentItem = {
@@ -521,15 +565,11 @@ export class MultiDbManager {
       updated.slug = generateSlug(updates.title);
     }
 
-    if (existingIndex !== -1) {
-      this.localData.content[existingIndex] = updated;
-    }
-
-    // Update in all pools where the record exists
+    let updatedInDb = false;
     for (const conn of this.connections) {
       if (conn.pool && conn.status === 'connected') {
         try {
-          await conn.pool.query(`
+          const res = await conn.pool.query(`
             UPDATE content SET
               title = $1, slug = $2, description = $3, poster_url = $4, backdrop_url = $5,
               category_id = $6, category_name = $7, category_slug = $8, genres = $9, tags = $10,
@@ -547,43 +587,54 @@ export class MultiDbManager {
             JSON.stringify(updated.howToAccessSteps || []), JSON.stringify(updated.accessOptions || []),
             new Date(updated.updatedAt), updated.id
           ]);
+          if ((res.rowCount ?? 0) > 0) updatedInDb = true;
         } catch (e) {
-          console.warn(`[MultiDbManager] Update failed on ${conn.envKey}:`, e);
+          console.error(`[MultiDbManager] Update failed on ${conn.envKey}:`, e);
+          if (this.isProduction()) throw e;
         }
       }
     }
 
-    return updated;
+    if (!this.hasRealDatabases()) {
+      const idx = this.localDevData.content.findIndex(c => c.id === id);
+      if (idx !== -1) this.localDevData.content[idx] = updated;
+      return updated;
+    }
+
+    return updatedInDb ? updated : existing;
   }
 
-  /**
-   * DELETE CONTENT: Deletes from whichever database holds it
-   */
   public async deleteContent(id: string): Promise<boolean> {
-    this.localData.content = this.localData.content.filter(c => c.id !== id);
-
+    let deleted = false;
     for (const conn of this.connections) {
       if (conn.pool && conn.status === 'connected') {
         try {
-          await conn.pool.query(`DELETE FROM content WHERE id = $1`, [id]);
+          const res = await conn.pool.query(`DELETE FROM content WHERE id = $1`, [id]);
+          if ((res.rowCount ?? 0) > 0) deleted = true;
         } catch (e) {
-          console.warn(`[MultiDbManager] Delete failed on ${conn.envKey}:`, e);
+          console.error(`[MultiDbManager] Delete failed on ${conn.envKey}:`, e);
+          if (this.isProduction()) throw e;
         }
       }
     }
-    return true;
+
+    if (!this.hasRealDatabases()) {
+      this.localDevData.content = this.localDevData.content.filter(c => c.id !== id);
+      return true;
+    }
+
+    return deleted;
   }
 
   // ==========================================
-  // CATEGORIES, GENRES, TAGS
+  // CATEGORIES
   // ==========================================
 
   public async getCategories(): Promise<Category[]> {
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
-      try {
-        const res = await primary.pool.query(`SELECT * FROM categories ORDER BY display_order ASC`);
-        if (res.rows.length > 0) {
+    for (const conn of this.connections) {
+      if (conn.pool && conn.status === 'connected') {
+        try {
+          const res = await conn.pool.query(`SELECT * FROM categories ORDER BY display_order ASC, name ASC`);
           return res.rows.map(r => ({
             id: r.id,
             name: r.name,
@@ -593,12 +644,18 @@ export class MultiDbManager {
             displayOrder: r.display_order,
             createdAt: r.created_at
           }));
+        } catch (e) {
+          console.error(`[MultiDbManager] getCategories error on ${conn.envKey}:`, e);
+          if (this.isProduction()) throw e;
         }
-      } catch (e) {
-        console.warn('[MultiDbManager] getCategories error:', e);
       }
     }
-    return [...this.localData.categories].sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
+
+    if (this.isProduction()) {
+      throw new Error('Database error retrieving categories.');
+    }
+
+    return [...this.localDevData.categories].sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
   }
 
   public async createCategory(input: Omit<Category, 'id' | 'createdAt'>): Promise<Category> {
@@ -609,61 +666,97 @@ export class MultiDbManager {
       slug: input.slug ? generateSlug(input.slug) : generateSlug(input.name),
       createdAt: new Date().toISOString()
     };
-    this.localData.categories.push(cat);
 
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
       try {
         await primary.pool.query(`
           INSERT INTO categories (id, name, slug, description, image_url, display_order, created_at)
           VALUES ($1, $2, $3, $4, $5, $6, $7)
         `, [cat.id, cat.name, cat.slug, cat.description || null, cat.imageUrl || null, cat.displayOrder || 0, new Date(cat.createdAt)]);
+        return cat;
       } catch (e) {
-        console.warn('[MultiDbManager] createCategory error:', e);
+        console.error('[MultiDbManager] createCategory error:', e);
+        throw e;
       }
     }
+
+    if (this.isProduction()) {
+      throw new Error('Database error: Unable to create category.');
+    }
+
+    this.localDevData.categories.push(cat);
     return cat;
   }
 
   public async updateCategory(id: string, updates: Partial<Category>): Promise<Category | null> {
-    const idx = this.localData.categories.findIndex(c => c.id === id);
-    if (idx === -1) return null;
-    const updated = { ...this.localData.categories[idx], ...updates };
-    this.localData.categories[idx] = updated;
-
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
       try {
+        const existingRes = await primary.pool.query(`SELECT * FROM categories WHERE id = $1`, [id]);
+        if (existingRes.rows.length === 0) return null;
+        const current = existingRes.rows[0];
+        const updated = {
+          name: updates.name ?? current.name,
+          slug: updates.slug ? generateSlug(updates.slug) : current.slug,
+          description: updates.description ?? current.description,
+          imageUrl: updates.imageUrl ?? current.image_url,
+          displayOrder: updates.displayOrder ?? current.display_order
+        };
         await primary.pool.query(`
           UPDATE categories SET name = $1, slug = $2, description = $3, image_url = $4, display_order = $5
           WHERE id = $6
-        `, [updated.name, updated.slug, updated.description || null, updated.imageUrl || null, updated.displayOrder || 0, id]);
+        `, [updated.name, updated.slug, updated.description, updated.imageUrl, updated.displayOrder, id]);
+        return {
+          id,
+          name: updated.name,
+          slug: updated.slug,
+          description: updated.description,
+          imageUrl: updated.imageUrl,
+          displayOrder: updated.displayOrder,
+          createdAt: current.created_at
+        };
       } catch (e) {
-        console.warn('[MultiDbManager] updateCategory error:', e);
+        console.error('[MultiDbManager] updateCategory error:', e);
+        throw e;
       }
     }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+
+    const idx = this.localDevData.categories.findIndex(c => c.id === id);
+    if (idx === -1) return null;
+    const updated = { ...this.localDevData.categories[idx], ...updates };
+    this.localDevData.categories[idx] = updated;
     return updated;
   }
 
   public async deleteCategory(id: string): Promise<boolean> {
-    this.localData.categories = this.localData.categories.filter(c => c.id !== id);
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
       try {
         await primary.pool.query(`DELETE FROM categories WHERE id = $1`, [id]);
+        return true;
       } catch (e) {
-        console.warn('[MultiDbManager] deleteCategory error:', e);
+        console.error('[MultiDbManager] deleteCategory error:', e);
+        throw e;
       }
     }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.categories = this.localDevData.categories.filter(c => c.id !== id);
     return true;
   }
 
+  // ==========================================
+  // GENRES
+  // ==========================================
+
   public async getGenres(): Promise<Genre[]> {
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
-      try {
-        const res = await primary.pool.query(`SELECT * FROM genres ORDER BY name ASC`);
-        if (res.rows.length > 0) {
+    for (const conn of this.connections) {
+      if (conn.pool && conn.status === 'connected') {
+        try {
+          const res = await conn.pool.query(`SELECT * FROM genres ORDER BY name ASC`);
           return res.rows.map(r => ({
             id: r.id,
             name: r.name,
@@ -671,12 +764,15 @@ export class MultiDbManager {
             description: r.description,
             createdAt: r.created_at
           }));
+        } catch (e) {
+          console.error('[MultiDbManager] getGenres error:', e);
+          if (this.isProduction()) throw e;
         }
-      } catch (e) {
-        console.warn('[MultiDbManager] getGenres error:', e);
       }
     }
-    return [...this.localData.genres];
+
+    if (this.isProduction()) throw new Error('Database error retrieving genres');
+    return [...this.localDevData.genres];
   }
 
   public async createGenre(input: Omit<Genre, 'id' | 'createdAt'>): Promise<Genre> {
@@ -687,17 +783,68 @@ export class MultiDbManager {
       slug: input.slug ? generateSlug(input.slug) : generateSlug(input.name),
       createdAt: new Date().toISOString()
     };
-    this.localData.genres.push(item);
+
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`
+          INSERT INTO genres (id, name, slug, description, created_at)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [item.id, item.name, item.slug, item.description || null, new Date(item.createdAt)]);
+        return item;
+      } catch (e) {
+        console.error('[MultiDbManager] createGenre error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.genres.push(item);
     return item;
   }
 
   public async deleteGenre(id: string): Promise<boolean> {
-    this.localData.genres = this.localData.genres.filter(g => g.id !== id);
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`DELETE FROM genres WHERE id = $1`, [id]);
+        return true;
+      } catch (e) {
+        console.error('[MultiDbManager] deleteGenre error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.genres = this.localDevData.genres.filter(g => g.id !== id);
     return true;
   }
 
+  // ==========================================
+  // TAGS
+  // ==========================================
+
   public async getTags(): Promise<Tag[]> {
-    return [...this.localData.tags];
+    for (const conn of this.connections) {
+      if (conn.pool && conn.status === 'connected') {
+        try {
+          const res = await conn.pool.query(`SELECT * FROM tags ORDER BY name ASC`);
+          return res.rows.map(r => ({
+            id: r.id,
+            name: r.name,
+            slug: r.slug,
+            description: r.description,
+            createdAt: r.created_at
+          }));
+        } catch (e) {
+          console.error('[MultiDbManager] getTags error:', e);
+          if (this.isProduction()) throw e;
+        }
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database error retrieving tags');
+    return [...this.localDevData.tags];
   }
 
   public async createTag(input: Omit<Tag, 'id' | 'createdAt'>): Promise<Tag> {
@@ -708,64 +855,144 @@ export class MultiDbManager {
       slug: input.slug ? generateSlug(input.slug) : generateSlug(input.name),
       createdAt: new Date().toISOString()
     };
-    this.localData.tags.push(item);
+
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`
+          INSERT INTO tags (id, name, slug, created_at)
+          VALUES ($1, $2, $3, $4)
+        `, [item.id, item.name, item.slug, new Date(item.createdAt)]);
+        return item;
+      } catch (e) {
+        console.error('[MultiDbManager] createTag error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.tags.push(item);
     return item;
   }
 
   public async deleteTag(id: string): Promise<boolean> {
-    this.localData.tags = this.localData.tags.filter(t => t.id !== id);
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`DELETE FROM tags WHERE id = $1`, [id]);
+        return true;
+      } catch (e) {
+        console.error('[MultiDbManager] deleteTag error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.tags = this.localDevData.tags.filter(t => t.id !== id);
     return true;
   }
 
   // ==========================================
-  // SITE SETTINGS (BACKGROUND MOTION & TELEGRAM)
+  // SITE SETTINGS
   // ==========================================
 
   public async getSettings(): Promise<SiteSettings> {
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
-      try {
-        const res = await primary.pool.query(`SELECT data FROM site_settings WHERE id = 'global_settings'`);
-        if (res.rows.length > 0) {
-          return { ...INITIAL_SETTINGS, ...res.rows[0].data };
+    for (const conn of this.connections) {
+      if (conn.pool && conn.status === 'connected') {
+        try {
+          const res = await conn.pool.query(`SELECT data FROM site_settings WHERE id = 'global_settings'`);
+          if (res.rows.length > 0) {
+            return { ...INITIAL_SETTINGS, ...res.rows[0].data };
+          }
+        } catch (e) {
+          console.error('[MultiDbManager] getSettings error:', e);
+          if (this.isProduction()) throw e;
         }
-      } catch (e) {
-        console.warn('[MultiDbManager] getSettings error:', e);
       }
     }
-    return { ...INITIAL_SETTINGS, ...this.localData.settings };
+
+    return { ...INITIAL_SETTINGS, ...this.localDevData.settings };
   }
 
   public async updateSettings(updates: Partial<SiteSettings>): Promise<SiteSettings> {
-    this.localData.settings = {
-      ...INITIAL_SETTINGS,
-      ...this.localData.settings,
+    const current = await this.getSettings();
+    const updated: SiteSettings = {
+      ...current,
       ...updates,
       updatedAt: new Date().toISOString()
     };
 
-    const primary = this.connections[0];
-    if (primary && primary.pool && primary.status === 'connected') {
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
       try {
         await primary.pool.query(`
           INSERT INTO site_settings (id, data, updated_at)
           VALUES ($1, $2, NOW())
           ON CONFLICT (id) DO UPDATE SET data = $2, updated_at = NOW();
-        `, ['global_settings', JSON.stringify(this.localData.settings)]);
+        `, ['global_settings', JSON.stringify(updated)]);
+        return updated;
       } catch (e) {
-        console.warn('[MultiDbManager] updateSettings error:', e);
+        console.error('[MultiDbManager] updateSettings error:', e);
+        throw e;
       }
     }
 
-    return { ...this.localData.settings };
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.settings = updated;
+    return updated;
   }
 
   // ==========================================
-  // POPUPS MANAGEMENT
+  // POPUPS
   // ==========================================
 
   public async getPopups(activeOnly = false): Promise<Popup[]> {
-    let list = [...this.localData.popups];
+    for (const conn of this.connections) {
+      if (conn.pool && conn.status === 'connected') {
+        try {
+          const queryStr = activeOnly
+            ? `SELECT * FROM popups WHERE active = TRUE ORDER BY priority ASC`
+            : `SELECT * FROM popups ORDER BY priority ASC`;
+          const res = await conn.pool.query(queryStr);
+          return res.rows.map(r => ({
+            id: r.id,
+            title: r.title,
+            message: r.message,
+            btn1Text: r.btn1_text,
+            btn1Url: r.btn1_url,
+            btn1Enabled: r.btn1_enabled,
+            btn2Text: r.btn2_text,
+            btn2Url: r.btn2_url,
+            btn2Enabled: r.btn2_enabled,
+            bgImageUrl: r.bg_image_url,
+            type: r.type,
+            position: r.position,
+            frequency: r.frequency,
+            delaySeconds: r.delay_seconds,
+            showOn: r.show_on,
+            pagePaths: r.page_paths,
+            startDate: r.start_date,
+            endDate: r.end_date,
+            active: r.active,
+            priority: r.priority,
+            showCloseBtn: r.show_close_btn,
+            showOverlay: r.show_overlay,
+            closeOnOverlay: r.close_on_overlay,
+            cooldownEnabled: r.cooldown_enabled,
+            cooldownHours: r.cooldown_hours,
+            createdAt: r.created_at,
+            updatedAt: r.updated_at
+          }));
+        } catch (e) {
+          console.error('[MultiDbManager] getPopups error:', e);
+          if (this.isProduction()) throw e;
+        }
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database error retrieving popups');
+
+    let list = [...this.localDevData.popups];
     if (activeOnly) {
       const now = new Date();
       list = list.filter(p => {
@@ -787,25 +1014,105 @@ export class MultiDbManager {
       createdAt: now,
       updatedAt: now
     };
-    this.localData.popups.push(p);
+
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`
+          INSERT INTO popups (
+            id, title, message, btn1_text, btn1_url, btn1_enabled,
+            btn2_text, btn2_url, btn2_enabled, bg_image_url, type,
+            position, frequency, delay_seconds, show_on, page_paths,
+            start_date, end_date, active, priority, show_close_btn,
+            show_overlay, close_on_overlay, cooldown_enabled, cooldown_hours,
+            created_at, updated_at
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+            $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
+          )
+        `, [
+          p.id, p.title, p.message, p.btn1Text || null, p.btn1Url || null, p.btn1Enabled ?? true,
+          p.btn2Text || null, p.btn2Url || null, p.btn2Enabled ?? false, p.bgImageUrl || null, p.type || 'announcement',
+          p.position || 'center', p.frequency || 'once_per_session', p.delaySeconds || 2, p.showOn || 'all', p.pagePaths || null,
+          p.startDate ? new Date(p.startDate) : null, p.endDate ? new Date(p.endDate) : null, p.active ?? true, p.priority || 1,
+          p.showCloseBtn ?? true, p.showOverlay ?? true, p.closeOnOverlay ?? true, p.cooldownEnabled ?? false, p.cooldownHours || 24,
+          new Date(p.createdAt), new Date(p.updatedAt)
+        ]);
+        return p;
+      } catch (e) {
+        console.error('[MultiDbManager] createPopup error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.popups.push(p);
     return p;
   }
 
   public async updatePopup(id: string, updates: Partial<Popup>): Promise<Popup | null> {
-    const idx = this.localData.popups.findIndex(p => p.id === id);
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        const existing = await primary.pool.query(`SELECT * FROM popups WHERE id = $1`, [id]);
+        if (existing.rows.length === 0) return null;
+        const cur = existing.rows[0];
+        const now = new Date();
+
+        await primary.pool.query(`
+          UPDATE popups SET
+            title = $1, message = $2, btn1_text = $3, btn1_url = $4, btn1_enabled = $5,
+            btn2_text = $6, btn2_url = $7, btn2_enabled = $8, bg_image_url = $9, type = $10,
+            position = $11, frequency = $12, delay_seconds = $13, show_on = $14, page_paths = $15,
+            start_date = $16, end_date = $17, active = $18, priority = $19, show_close_btn = $20,
+            show_overlay = $21, close_on_overlay = $22, cooldown_enabled = $23, cooldown_hours = $24,
+            updated_at = $25
+          WHERE id = $26
+        `, [
+          updates.title ?? cur.title, updates.message ?? cur.message, updates.btn1Text ?? cur.btn1_text,
+          updates.btn1Url ?? cur.btn1_url, updates.btn1Enabled ?? cur.btn1_enabled, updates.btn2Text ?? cur.btn2_text,
+          updates.btn2Url ?? cur.btn2_url, updates.btn2Enabled ?? cur.btn2_enabled, updates.bgImageUrl ?? cur.bg_image_url,
+          updates.type ?? cur.type, updates.position ?? cur.position, updates.frequency ?? cur.frequency,
+          updates.delaySeconds ?? cur.delay_seconds, updates.showOn ?? cur.show_on, updates.pagePaths ?? cur.page_paths,
+          updates.startDate ? new Date(updates.startDate) : cur.start_date,
+          updates.endDate ? new Date(updates.endDate) : cur.end_date,
+          updates.active ?? cur.active, updates.priority ?? cur.priority,
+          updates.showCloseBtn ?? cur.show_close_btn, updates.showOverlay ?? cur.show_overlay,
+          updates.closeOnOverlay ?? cur.close_on_overlay, updates.cooldownEnabled ?? cur.cooldown_enabled,
+          updates.cooldownHours ?? cur.cooldown_hours, now, id
+        ]);
+
+        const updatedRes = await primary.pool.query(`SELECT * FROM popups WHERE id = $1`, [id]);
+        return updatedRes.rows[0];
+      } catch (e) {
+        console.error('[MultiDbManager] updatePopup error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+
+    const idx = this.localDevData.popups.findIndex(p => p.id === id);
     if (idx === -1) return null;
-    const updated = {
-      ...this.localData.popups[idx],
-      ...updates,
-      id,
-      updatedAt: new Date().toISOString()
-    };
-    this.localData.popups[idx] = updated;
+    const updated = { ...this.localDevData.popups[idx], ...updates, updatedAt: new Date().toISOString() };
+    this.localDevData.popups[idx] = updated;
     return updated;
   }
 
   public async deletePopup(id: string): Promise<boolean> {
-    this.localData.popups = this.localData.popups.filter(p => p.id !== id);
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`DELETE FROM popups WHERE id = $1`, [id]);
+        return true;
+      } catch (e) {
+        console.error('[MultiDbManager] deletePopup error:', e);
+        throw e;
+      }
+    }
+
+    if (this.isProduction()) throw new Error('Database unavailable');
+    this.localDevData.popups = this.localDevData.popups.filter(p => p.id !== id);
     return true;
   }
 
@@ -813,26 +1120,80 @@ export class MultiDbManager {
   // ADMIN AUTHENTICATION
   // ==========================================
 
-  public async verifyAdmin(email: string, passwordPlain: string): Promise<AdminUser | null> {
-    const user = this.localData.adminUsers.find(u => u.email.toLowerCase() === email.toLowerCase().trim());
-    if (!user) return null;
+  public async verifyAdmin(email: string, passwordPlain: string, env: Record<string, any> = {}): Promise<AdminUser | null> {
+    const cleanEmail = email.toLowerCase().trim();
 
-    const isValid = await bcrypt.compare(passwordPlain, user.passwordHash);
-    if (!isValid) return null;
+    // 1. Check database for existing admin users
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        const res = await primary.pool.query(`SELECT * FROM admin_users WHERE LOWER(email) = $1 LIMIT 1`, [cleanEmail]);
+        if (res.rows.length > 0) {
+          const user = res.rows[0];
+          const isValid = await bcrypt.compare(passwordPlain, user.password_hash);
+          if (isValid) {
+            return {
+              id: user.id,
+              email: user.email,
+              name: user.name,
+              role: user.role || 'superadmin',
+              createdAt: user.created_at
+            };
+          }
+          return null;
+        }
+      } catch (err) {
+        console.error('[MultiDbManager] Error querying admin user from database:', err);
+      }
+    }
 
-    return {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      createdAt: user.createdAt
-    };
+    // 2. Check environment credentials (ADMIN_EMAIL, ADMIN_PASSWORD)
+    const adminEmail = (env.ADMIN_EMAIL || (typeof process !== 'undefined' ? process.env?.ADMIN_EMAIL : ''))?.trim().toLowerCase();
+    const adminPassword = (env.ADMIN_PASSWORD || (typeof process !== 'undefined' ? process.env?.ADMIN_PASSWORD : ''))?.trim();
+
+    if (adminEmail && adminPassword && cleanEmail === adminEmail) {
+      if (passwordPlain === adminPassword) {
+        const adminObj: AdminUser = {
+          id: 'admin-master',
+          email: adminEmail,
+          name: 'SKx Movies Chief Admin',
+          role: 'superadmin',
+          createdAt: new Date().toISOString()
+        };
+
+        // If database is connected, persist this verified admin with a hashed password
+        if (primary && primary.pool) {
+          try {
+            const hash = await bcrypt.hash(passwordPlain, 10);
+            await primary.pool.query(`
+              INSERT INTO admin_users (id, email, password_hash, name, role, created_at)
+              VALUES ($1, $2, $3, $4, $5, NOW())
+              ON CONFLICT (email) DO NOTHING
+            `, [adminObj.id, adminObj.email, hash, adminObj.name, adminObj.role]);
+          } catch {}
+        }
+
+        return adminObj;
+      }
+    }
+
+    return null;
   }
 
   public async changeAdminPassword(userId: string, newPasswordPlain: string): Promise<boolean> {
-    const user = this.localData.adminUsers.find(u => u.id === userId);
-    if (!user) return false;
-    user.passwordHash = await bcrypt.hash(newPasswordPlain, 10);
+    const hash = await bcrypt.hash(newPasswordPlain, 10);
+
+    const primary = this.connections.find(c => c.pool && c.status === 'connected');
+    if (primary && primary.pool) {
+      try {
+        await primary.pool.query(`UPDATE admin_users SET password_hash = $1 WHERE id = $2`, [hash, userId]);
+        return true;
+      } catch (e) {
+        console.error('[MultiDbManager] changeAdminPassword error:', e);
+        throw e;
+      }
+    }
+
     return true;
   }
 
@@ -847,13 +1208,17 @@ export class MultiDbManager {
     const drafts = all.length - published;
     const totalViews = all.reduce((acc, c) => acc + (c.views || 0), 0);
 
+    const categories = await this.getCategories().catch(() => []);
+    const genres = await this.getGenres().catch(() => []);
+    const tags = await this.getTags().catch(() => []);
+
     return {
       totalContent: all.length,
       published,
       drafts,
-      totalCategories: this.localData.categories.length,
-      totalGenres: this.localData.genres.length,
-      totalTags: this.localData.tags.length,
+      totalCategories: categories.length,
+      totalGenres: genres.length,
+      totalTags: tags.length,
       totalViews,
       dbStatus: this.getDbStatus(),
       recentContent: all.slice(0, 8)

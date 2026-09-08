@@ -1,5 +1,5 @@
 import { multiDb } from './db/multi-db';
-import { signAdminToken, verifyAdminToken } from './auth';
+import { signAdminToken, verifyAdminToken, TokenPayload } from './auth';
 
 export interface ApiRequest {
   method: string;
@@ -25,16 +25,28 @@ function getBearerToken(req: ApiRequest): string | null {
   return null;
 }
 
-function checkAdminAuth(req: ApiRequest): boolean {
-  const token = getBearerToken(req);
-  if (!token) return false;
-  const payload = verifyAdminToken(token);
-  return payload !== null;
+function getJwtSecret(env: Record<string, any> = {}): string {
+  return (
+    env.JWT_SECRET ||
+    (typeof process !== 'undefined' ? process.env?.JWT_SECRET : '') ||
+    'skxmovies_default_secret_key_change_in_production'
+  );
 }
 
-export async function handleApiRequest(req: ApiRequest): Promise<ApiResponse> {
-  // Ensure DB initialized
-  await multiDb.init();
+async function checkAdminAuth(req: ApiRequest, env: Record<string, any>): Promise<TokenPayload | null> {
+  const token = getBearerToken(req);
+  if (!token) return null;
+  const secret = getJwtSecret(env);
+  if (!secret) return null;
+  return await verifyAdminToken(token, secret);
+}
+
+export async function handleApiRequest(req: ApiRequest, env: Record<string, any> = {}): Promise<ApiResponse> {
+  // Ensure DB connection is configured from env
+  multiDb.discoverDatabases(env);
+  await multiDb.init().catch(err => {
+    console.error('[API Router] multiDb.init() error:', err);
+  });
 
   const method = req.method.toUpperCase();
   const rawPath = req.path.replace(/^\/api/, '');
@@ -42,45 +54,70 @@ export async function handleApiRequest(req: ApiRequest): Promise<ApiResponse> {
 
   // 1. Health check
   if (path === '/health' && method === 'GET') {
-    return { status: 200, body: { status: 'ok', time: new Date().toISOString() } };
-  }
-
-  // 2. Homepage Bundle (Ultra fast initial load)
-  if (path === '/homepage' && method === 'GET') {
-    const [featuredRes, trendingRes, latestRes, categories, genres, settings, popups] = await Promise.all([
-      multiDb.getAllContent({ featured: true, limit: 6, status: 'published' }),
-      multiDb.getAllContent({ sortBy: 'views', limit: 12, status: 'published' }),
-      multiDb.getAllContent({ sortBy: 'createdAt', limit: 12, status: 'published' }),
-      multiDb.getCategories(),
-      multiDb.getGenres(),
-      multiDb.getSettings(),
-      multiDb.getPopups(true)
-    ]);
-
     return {
       status: 200,
       body: {
-        featured: featuredRes.items,
-        trending: trendingRes.items,
-        latest: latestRes.items,
-        categories,
-        genres,
-        settings,
-        popups
+        status: 'ok',
+        runtime: 'Cloudflare Pages Functions',
+        time: new Date().toISOString(),
+        dbStatus: multiDb.getDbStatus()
       }
     };
   }
 
+  // 2. Homepage Bundle (Ultra fast initial load)
+  if (path === '/homepage' && method === 'GET') {
+    try {
+      const [featuredRes, trendingRes, latestRes, categories, genres, settings, popups] = await Promise.all([
+        multiDb.getAllContent({ featured: true, limit: 6, status: 'published' }),
+        multiDb.getAllContent({ sortBy: 'views', limit: 12, status: 'published' }),
+        multiDb.getAllContent({ sortBy: 'createdAt', limit: 12, status: 'published' }),
+        multiDb.getCategories(),
+        multiDb.getGenres(),
+        multiDb.getSettings(),
+        multiDb.getPopups(true)
+      ]);
+
+      return {
+        status: 200,
+        body: {
+          featured: featuredRes.items,
+          trending: trendingRes.items,
+          latest: latestRes.items,
+          categories,
+          genres,
+          settings,
+          popups
+        }
+      };
+    } catch (err: any) {
+      console.error('[API Router] /homepage error:', err);
+      return {
+        status: 500,
+        body: { error: err.message || 'Failed to load homepage data' }
+      };
+    }
+  }
+
   // 3. Settings
   if (path === '/settings' && method === 'GET') {
-    const settings = await multiDb.getSettings();
-    return { status: 200, body: settings };
+    try {
+      const settings = await multiDb.getSettings();
+      return { status: 200, body: settings };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to load settings' } };
+    }
   }
 
   if (path === '/settings' && method === 'PUT') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const updated = await multiDb.updateSettings(req.body || {});
-    return { status: 200, body: updated };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const updated = await multiDb.updateSettings(req.body || {});
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update settings' } };
+    }
   }
 
   // 4. Admin Auth
@@ -89,24 +126,23 @@ export async function handleApiRequest(req: ApiRequest): Promise<ApiResponse> {
     if (!email || !password) {
       return { status: 400, body: { error: 'Email and password required' } };
     }
-    const admin = await multiDb.verifyAdmin(email, password);
+    const secret = getJwtSecret(env);
+    const admin = await multiDb.verifyAdmin(email, password, env);
     if (!admin) {
       return { status: 401, body: { error: 'Invalid admin credentials' } };
     }
-    const token = signAdminToken(admin);
+    const token = await signAdminToken(admin, secret);
     return { status: 200, body: { token, user: admin } };
   }
 
   if (path === '/admin/me' && method === 'GET') {
-    const token = getBearerToken(req);
-    const payload = token ? verifyAdminToken(token) : null;
+    const payload = await checkAdminAuth(req, env);
     if (!payload) return { status: 401, body: { error: 'Unauthorized' } };
     return { status: 200, body: { user: payload } };
   }
 
   if (path === '/admin/change-password' && method === 'POST') {
-    const token = getBearerToken(req);
-    const payload = token ? verifyAdminToken(token) : null;
+    const payload = await checkAdminAuth(req, env);
     if (!payload) return { status: 401, body: { error: 'Unauthorized' } };
     const { newPassword } = req.body || {};
     if (!newPassword || newPassword.length < 6) {
@@ -117,176 +153,296 @@ export async function handleApiRequest(req: ApiRequest): Promise<ApiResponse> {
   }
 
   if (path === '/admin/stats' && method === 'GET') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const stats = await multiDb.getStats();
-    return { status: 200, body: stats };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const stats = await multiDb.getStats();
+      return { status: 200, body: stats };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to fetch admin stats' } };
+    }
   }
 
   // 5. Content Management
   if (path === '/content' && method === 'GET') {
-    const isAdmin = checkAdminAuth(req);
+    const auth = await checkAdminAuth(req, env);
+    const isAdmin = Boolean(auth);
     const params = {
       ...req.query,
       status: isAdmin ? (req.query.status as any || 'all') : 'published'
     };
-    const result = await multiDb.getAllContent(params);
-    return { status: 200, body: result };
+    try {
+      const result = await multiDb.getAllContent(params);
+      return { status: 200, body: result };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to retrieve content' } };
+    }
   }
 
   if (path.startsWith('/content/slug/') && method === 'GET') {
     const slug = path.replace('/content/slug/', '');
-    const item = await multiDb.getContentBySlug(slug, true);
-    if (!item) return { status: 404, body: { error: 'Content not found' } };
-    return { status: 200, body: item };
+    try {
+      const item = await multiDb.getContentBySlug(slug, true);
+      if (!item) return { status: 404, body: { error: 'Content not found' } };
+      return { status: 200, body: item };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to load content' } };
+    }
   }
 
   if (path.match(/^\/content\/[^/]+$/) && method === 'GET') {
     const id = path.replace('/content/', '');
-    const item = await multiDb.getContentById(id);
-    if (!item) return { status: 404, body: { error: 'Content not found' } };
-    return { status: 200, body: item };
+    try {
+      const item = await multiDb.getContentById(id);
+      if (!item) return { status: 404, body: { error: 'Content not found' } };
+      return { status: 200, body: item };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to load content' } };
+    }
   }
 
   if (path === '/content' && method === 'POST') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const created = await multiDb.createContent(req.body);
-    return { status: 201, body: created };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const created = await multiDb.createContent(req.body);
+      return { status: 201, body: created };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to create content' } };
+    }
   }
 
   if (path.match(/^\/content\/[^/]+$/) && method === 'PUT') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/content/', '');
-    const updated = await multiDb.updateContent(id, req.body);
-    if (!updated) return { status: 404, body: { error: 'Content not found' } };
-    return { status: 200, body: updated };
+    try {
+      const updated = await multiDb.updateContent(id, req.body);
+      if (!updated) return { status: 404, body: { error: 'Content not found' } };
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update content' } };
+    }
   }
 
   if (path.match(/^\/content\/[^/]+$/) && method === 'DELETE') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/content/', '');
-    await multiDb.deleteContent(id);
-    return { status: 200, body: { success: true } };
+    try {
+      await multiDb.deleteContent(id);
+      return { status: 200, body: { success: true } };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to delete content' } };
+    }
   }
 
   if (path.match(/^\/content\/[^/]+\/status$/) && method === 'PATCH') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.split('/')[2];
     const { status } = req.body || {};
-    const updated = await multiDb.updateContent(id, { status });
-    return { status: 200, body: updated };
+    try {
+      const updated = await multiDb.updateContent(id, { status });
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update status' } };
+    }
   }
 
   if (path.match(/^\/content\/[^/]+\/featured$/) && method === 'PATCH') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.split('/')[2];
     const { featured } = req.body || {};
-    const updated = await multiDb.updateContent(id, { featured: Boolean(featured) });
-    return { status: 200, body: updated };
+    try {
+      const updated = await multiDb.updateContent(id, { featured: Boolean(featured) });
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update featured' } };
+    }
   }
 
   // 6. Categories
   if (path === '/categories' && method === 'GET') {
-    const categories = await multiDb.getCategories();
-    return { status: 200, body: categories };
+    try {
+      const categories = await multiDb.getCategories();
+      return { status: 200, body: categories };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to get categories' } };
+    }
   }
 
   if (path === '/categories' && method === 'POST') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const created = await multiDb.createCategory(req.body);
-    return { status: 201, body: created };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const created = await multiDb.createCategory(req.body);
+      return { status: 201, body: created };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to create category' } };
+    }
   }
 
   if (path.match(/^\/categories\/[^/]+$/) && method === 'PUT') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/categories/', '');
-    const updated = await multiDb.updateCategory(id, req.body);
-    return { status: 200, body: updated };
+    try {
+      const updated = await multiDb.updateCategory(id, req.body);
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update category' } };
+    }
   }
 
   if (path.match(/^\/categories\/[^/]+$/) && method === 'DELETE') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/categories/', '');
-    await multiDb.deleteCategory(id);
-    return { status: 200, body: { success: true } };
+    try {
+      await multiDb.deleteCategory(id);
+      return { status: 200, body: { success: true } };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to delete category' } };
+    }
   }
 
   // 7. Genres
   if (path === '/genres' && method === 'GET') {
-    const genres = await multiDb.getGenres();
-    return { status: 200, body: genres };
+    try {
+      const genres = await multiDb.getGenres();
+      return { status: 200, body: genres };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to get genres' } };
+    }
   }
 
   if (path === '/genres' && method === 'POST') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const created = await multiDb.createGenre(req.body);
-    return { status: 201, body: created };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const created = await multiDb.createGenre(req.body);
+      return { status: 201, body: created };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to create genre' } };
+    }
   }
 
   if (path.match(/^\/genres\/[^/]+$/) && method === 'DELETE') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/genres/', '');
-    await multiDb.deleteGenre(id);
-    return { status: 200, body: { success: true } };
+    try {
+      await multiDb.deleteGenre(id);
+      return { status: 200, body: { success: true } };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to delete genre' } };
+    }
   }
 
   // 8. Tags
   if (path === '/tags' && method === 'GET') {
-    const tags = await multiDb.getTags();
-    return { status: 200, body: tags };
+    try {
+      const tags = await multiDb.getTags();
+      return { status: 200, body: tags };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to get tags' } };
+    }
   }
 
   if (path === '/tags' && method === 'POST') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const created = await multiDb.createTag(req.body);
-    return { status: 201, body: created };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const created = await multiDb.createTag(req.body);
+      return { status: 201, body: created };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to create tag' } };
+    }
   }
 
   if (path.match(/^\/tags\/[^/]+$/) && method === 'DELETE') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/tags/', '');
-    await multiDb.deleteTag(id);
-    return { status: 200, body: { success: true } };
+    try {
+      await multiDb.deleteTag(id);
+      return { status: 200, body: { success: true } };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to delete tag' } };
+    }
   }
 
   // 9. Popups
   if (path === '/popups' && method === 'GET') {
-    const popups = await multiDb.getPopups(true);
-    return { status: 200, body: popups };
+    try {
+      const popups = await multiDb.getPopups(true);
+      return { status: 200, body: popups };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to get popups' } };
+    }
   }
 
   if (path === '/admin/popups' && method === 'GET') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const popups = await multiDb.getPopups(false);
-    return { status: 200, body: popups };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const popups = await multiDb.getPopups(false);
+      return { status: 200, body: popups };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to get popups' } };
+    }
   }
 
   if (path === '/admin/popups' && method === 'POST') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
-    const created = await multiDb.createPopup(req.body);
-    return { status: 201, body: created };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
+    try {
+      const created = await multiDb.createPopup(req.body);
+      return { status: 201, body: created };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to create popup' } };
+    }
   }
 
   if (path.match(/^\/admin\/popups\/[^/]+$/) && method === 'PUT') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/admin/popups/', '');
-    const updated = await multiDb.updatePopup(id, req.body);
-    return { status: 200, body: updated };
+    try {
+      const updated = await multiDb.updatePopup(id, req.body);
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to update popup' } };
+    }
   }
 
   if (path.match(/^\/admin\/popups\/[^/]+$/) && method === 'DELETE') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.replace('/admin/popups/', '');
-    await multiDb.deletePopup(id);
-    return { status: 200, body: { success: true } };
+    try {
+      await multiDb.deletePopup(id);
+      return { status: 200, body: { success: true } };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to delete popup' } };
+    }
   }
 
   if (path.match(/^\/admin\/popups\/[^/]+\/toggle$/) && method === 'PATCH') {
-    if (!checkAdminAuth(req)) return { status: 401, body: { error: 'Unauthorized' } };
+    const auth = await checkAdminAuth(req, env);
+    if (!auth) return { status: 401, body: { error: 'Unauthorized' } };
     const id = path.split('/')[3];
-    const existing = (await multiDb.getPopups(false)).find(p => p.id === id);
-    if (!existing) return { status: 404, body: { error: 'Popup not found' } };
-    const updated = await multiDb.updatePopup(id, { active: !existing.active });
-    return { status: 200, body: updated };
+    try {
+      const popups = await multiDb.getPopups(false);
+      const existing = popups.find(p => p.id === id);
+      if (!existing) return { status: 404, body: { error: 'Popup not found' } };
+      const updated = await multiDb.updatePopup(id, { active: !existing.active });
+      return { status: 200, body: updated };
+    } catch (err: any) {
+      return { status: 500, body: { error: err.message || 'Failed to toggle popup' } };
+    }
   }
 
   return {
