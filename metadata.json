@@ -1,0 +1,7 @@
+{
+  "name": "SKxMOVIES",
+  "description": "Next-Gen cinematic streaming and media portal with CockroachDB multi-database support, Cloudflare Pages functions, customizable motion backgrounds, and Telegram community integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
