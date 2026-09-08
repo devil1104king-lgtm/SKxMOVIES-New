@@ -28,7 +28,6 @@ function getBearerToken(req: ApiRequest): string | null {
 function getJwtSecret(env: Record<string, any> = {}): string {
   return (
     env.JWT_SECRET ||
-    (typeof process !== 'undefined' ? process.env?.JWT_SECRET : '') ||
     'skxmovies_default_secret_key_change_in_production'
   );
 }

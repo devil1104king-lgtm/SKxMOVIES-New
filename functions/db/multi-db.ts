@@ -71,14 +71,17 @@ export class MultiDbManager {
     }>
   };
 
+  private lastDiscoveredKey = '';
+  private poolCache = new Map<string, pg.Pool>();
+
   constructor() {
-    this.discoverDatabases(typeof process !== 'undefined' ? process.env : {});
+    this.discoverDatabases({});
   }
 
   public isProduction(): boolean {
     const env = this.currentEnv;
-    const nodeEnv = env.NODE_ENV || (typeof process !== 'undefined' ? process.env?.NODE_ENV : '');
-    const environment = env.ENVIRONMENT || (typeof process !== 'undefined' ? process.env?.ENVIRONMENT : '');
+    const nodeEnv = env.NODE_ENV || '';
+    const environment = env.ENVIRONMENT || '';
     return nodeEnv === 'production' || environment === 'production';
   }
 
@@ -95,7 +98,7 @@ export class MultiDbManager {
 
     // 1. Check Cloudflare Hyperdrive binding first if available
     const hyperdriveUrl = envSource.HYPERDRIVE?.connectionString;
-    const primaryUrl = (hyperdriveUrl || envSource.DATABASE_URL || (typeof process !== 'undefined' ? process.env?.DATABASE_URL : ''))?.trim();
+    const primaryUrl = (hyperdriveUrl || envSource.DATABASE_URL || '')?.trim();
 
     if (primaryUrl) {
       discovered.push({
@@ -111,7 +114,7 @@ export class MultiDbManager {
     // 2. Check DATABASE_URL_2 through DATABASE_URL_10
     for (let i = 2; i <= 10; i++) {
       const key = `DATABASE_URL_${i}`;
-      const url = (envSource[key] || (typeof process !== 'undefined' ? process.env?.[key] : ''))?.trim();
+      const url = (envSource[key] || '')?.trim();
       if (url) {
         discovered.push({
           index: i,
@@ -126,9 +129,8 @@ export class MultiDbManager {
 
     // If no real databases configured:
     if (discovered.length === 0) {
-      if (this.isProduction()) {
-        console.error('[MultiDbManager] ERROR: No DATABASE_URL configured in production environment!');
-      }
+      if (this.lastDiscoveredKey === 'memory-only') return;
+      this.lastDiscoveredKey = 'memory-only';
       discovered.push({
         index: 1,
         envKey: 'DATABASE_URL (Local Dev Memory)',
@@ -142,35 +144,44 @@ export class MultiDbManager {
       return;
     }
 
+    const newKey = discovered.map(d => `${d.index}:${d.url}`).join(';');
+    if (newKey === this.lastDiscoveredKey && this.connections.length > 0) {
+      return;
+    }
+    this.lastDiscoveredKey = newKey;
+
     // Mark the highest index as active write database
     discovered.sort((a, b) => a.index - b.index);
     const highest = discovered[discovered.length - 1];
     highest.isWriteActive = true;
     this.activeWriteIndex = highest.index;
 
-    // Initialize Pools with connection parameters optimized for serverless / edge
+    // Initialize or reuse Pools
     for (const conn of discovered) {
-      try {
-        const pool = new Pool({
-          connectionString: conn.url,
-          ssl: conn.url.includes('localhost') ? false : { rejectUnauthorized: false },
-          max: 5,
-          idleTimeoutMillis: 10000,
-          connectionTimeoutMillis: 6000
-        });
-        conn.pool = pool;
-        conn.status = 'connected';
-      } catch (err) {
-        console.warn(`[MultiDbManager] Warning: failed to initialize pool for ${conn.envKey}:`, err);
-        conn.status = 'unreachable';
+      let pool = this.poolCache.get(conn.url);
+      if (!pool) {
+        try {
+          pool = new Pool({
+            connectionString: conn.url,
+            ssl: conn.url.includes('localhost') ? false : { rejectUnauthorized: false },
+            max: 10,
+            idleTimeoutMillis: 30000,
+            connectionTimeoutMillis: 10000
+          });
+          this.poolCache.set(conn.url, pool);
+        } catch (err) {
+          console.warn(`[MultiDbManager] Warning: failed to create pool for ${conn.envKey}:`, err);
+        }
       }
+      conn.pool = pool || null;
+      conn.status = pool ? 'connected' : 'unreachable';
     }
 
     this.connections = discovered;
   }
 
   /**
-   * Idempotent table creation with concurrency-safe lock
+   * Idempotent table creation with concurrency-safe lock and initial seeding
    */
   public async init(): Promise<void> {
     if (this.isInitialized) return;
@@ -278,11 +289,108 @@ export class MultiDbManager {
             );
           `);
           conn.status = 'connected';
+
+          // Seed default data if tables are currently empty
+          try {
+            const catRes = await conn.pool.query('SELECT count(*) FROM categories');
+            if (parseInt(catRes.rows[0].count, 10) === 0) {
+              for (const c of INITIAL_CATEGORIES) {
+                await conn.pool.query(
+                  `INSERT INTO categories (id, name, slug, description, image_url, display_order, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+                  [c.id, c.name, c.slug, c.description || null, c.imageUrl || null, c.displayOrder || 0, new Date(c.createdAt)]
+                );
+              }
+            }
+
+            const genRes = await conn.pool.query('SELECT count(*) FROM genres');
+            if (parseInt(genRes.rows[0].count, 10) === 0) {
+              for (const g of INITIAL_GENRES) {
+                await conn.pool.query(
+                  `INSERT INTO genres (id, name, slug, description, created_at)
+                   VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
+                  [g.id, g.name, g.slug, g.description || null, new Date(g.createdAt)]
+                );
+              }
+            }
+
+            const tagRes = await conn.pool.query('SELECT count(*) FROM tags');
+            if (parseInt(tagRes.rows[0].count, 10) === 0) {
+              for (const t of INITIAL_TAGS) {
+                await conn.pool.query(
+                  `INSERT INTO tags (id, name, slug, created_at)
+                   VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING`,
+                  [t.id, t.name, t.slug, new Date(t.createdAt)]
+                );
+              }
+            }
+
+            const setRes = await conn.pool.query('SELECT count(*) FROM site_settings');
+            if (parseInt(setRes.rows[0].count, 10) === 0) {
+              await conn.pool.query(
+                `INSERT INTO site_settings (id, data, updated_at)
+                 VALUES ($1, $2, NOW()) ON CONFLICT (id) DO NOTHING`,
+                ['global_settings', JSON.stringify(INITIAL_SETTINGS)]
+              );
+            }
+
+            const popRes = await conn.pool.query('SELECT count(*) FROM popups');
+            if (parseInt(popRes.rows[0].count, 10) === 0) {
+              for (const p of INITIAL_POPUPS) {
+                await conn.pool.query(
+                  `INSERT INTO popups (
+                    id, title, message, btn1_text, btn1_url, btn1_enabled,
+                    btn2_text, btn2_url, btn2_enabled, bg_image_url, type,
+                    position, frequency, delay_seconds, show_on, page_paths,
+                    active, priority, show_close_btn, show_overlay, close_on_overlay,
+                    cooldown_enabled, cooldown_hours, created_at, updated_at
+                  ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25
+                  ) ON CONFLICT (id) DO NOTHING`,
+                  [
+                    p.id, p.title, p.message, p.btn1Text || null, p.btn1Url || null, p.btn1Enabled,
+                    p.btn2Text || null, p.btn2Url || null, p.btn2Enabled, p.bgImageUrl || null, p.type,
+                    p.position, p.frequency, p.delaySeconds, p.showOn, p.pagePaths || null,
+                    p.active, p.priority, p.showCloseBtn, p.showOverlay, p.closeOnOverlay,
+                    p.cooldownEnabled, p.cooldownHours, new Date(p.createdAt), new Date(p.updatedAt)
+                  ]
+                );
+              }
+            }
+
+            const contRes = await conn.pool.query('SELECT count(*) FROM content');
+            if (parseInt(contRes.rows[0].count, 10) === 0) {
+              for (const item of INITIAL_CONTENT) {
+                await conn.pool.query(`
+                  INSERT INTO content (
+                    id, title, slug, description, poster_url, backdrop_url,
+                    category_id, category_name, category_slug, genres, tags,
+                    release_date, duration, rating, language, featured, status,
+                    trailer_url, views, db_source, tutorial_title, tutorial_url,
+                    tutorial_thumbnail, how_to_access_title, how_to_access_instructions,
+                    how_to_access_steps, access_options, created_at, updated_at
+                  ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+                  ) ON CONFLICT (id) DO NOTHING
+                `, [
+                  item.id, item.title, item.slug, item.description, item.posterUrl, item.backdropUrl || null,
+                  item.categoryId, item.categoryName, item.categorySlug, JSON.stringify(item.genres), JSON.stringify(item.tags),
+                  item.releaseDate, item.duration || null, item.rating || null, item.language || null, item.featured, item.status,
+                  item.trailerUrl || null, item.views, conn.envKey, item.tutorialTitle || null, item.tutorialUrl || null,
+                  item.tutorialThumbnail || null, item.howToAccessTitle || null, item.howToAccessInstructions || null,
+                  JSON.stringify(item.howToAccessSteps || []), JSON.stringify(item.accessOptions || []),
+                  new Date(item.createdAt), new Date(item.updatedAt)
+                ]);
+              }
+            }
+          } catch (seedErr) {
+            console.warn(`[MultiDbManager] Warning seeding initial data on ${conn.envKey}:`, seedErr);
+          }
         } catch (err) {
           console.error(`[MultiDbManager] Error initializing schema on ${conn.envKey}:`, err);
-          if (this.isProduction()) {
-            throw new Error(`Database initialization failed on ${conn.envKey}: ${(err as Error).message}`);
-          }
+          conn.status = 'unreachable';
         }
       }
       this.isInitialized = true;
@@ -329,24 +437,20 @@ export class MultiDbManager {
         } catch (err) {
           lastError = err;
           console.error(`[MultiDbManager] Error querying content on ${conn.envKey}:`, err);
+          conn.status = 'unreachable';
         }
       }
 
-      if (!anySucceeded && this.isProduction()) {
-        throw new Error(`Database query failed on all connections: ${lastError?.message || 'Unknown database error'}`);
-      }
-
-      if (anySucceeded) {
+      if (anySucceeded && allItems.length > 0) {
         return this.filterAndPaginateContent(allItems, params);
       }
+
+      if (lastError) {
+        console.warn('[MultiDbManager] Falling back to default content due to query error:', lastError);
+      }
     }
 
-    // In production without live databases, fail explicitly
-    if (this.isProduction()) {
-      throw new Error('Database unavailable. Please check your DATABASE_URL configuration.');
-    }
-
-    // Local dev mode fallback
+    // Local dev mode fallback or when DB is empty/unreachable
     return this.filterAndPaginateContent(this.localDevData.content, params);
   }
 
@@ -635,24 +739,22 @@ export class MultiDbManager {
       if (conn.pool && conn.status === 'connected') {
         try {
           const res = await conn.pool.query(`SELECT * FROM categories ORDER BY display_order ASC, name ASC`);
-          return res.rows.map(r => ({
-            id: r.id,
-            name: r.name,
-            slug: r.slug,
-            description: r.description,
-            imageUrl: r.image_url,
-            displayOrder: r.display_order,
-            createdAt: r.created_at
-          }));
+          if (res.rows.length > 0) {
+            return res.rows.map(r => ({
+              id: r.id,
+              name: r.name,
+              slug: r.slug,
+              description: r.description,
+              imageUrl: r.image_url,
+              displayOrder: r.display_order,
+              createdAt: r.created_at
+            }));
+          }
         } catch (e) {
           console.error(`[MultiDbManager] getCategories error on ${conn.envKey}:`, e);
-          if (this.isProduction()) throw e;
+          conn.status = 'unreachable';
         }
       }
-    }
-
-    if (this.isProduction()) {
-      throw new Error('Database error retrieving categories.');
     }
 
     return [...this.localDevData.categories].sort((a, b) => (a.displayOrder || 0) - (b.displayOrder || 0));
@@ -757,21 +859,22 @@ export class MultiDbManager {
       if (conn.pool && conn.status === 'connected') {
         try {
           const res = await conn.pool.query(`SELECT * FROM genres ORDER BY name ASC`);
-          return res.rows.map(r => ({
-            id: r.id,
-            name: r.name,
-            slug: r.slug,
-            description: r.description,
-            createdAt: r.created_at
-          }));
+          if (res.rows.length > 0) {
+            return res.rows.map(r => ({
+              id: r.id,
+              name: r.name,
+              slug: r.slug,
+              description: r.description,
+              createdAt: r.created_at
+            }));
+          }
         } catch (e) {
           console.error('[MultiDbManager] getGenres error:', e);
-          if (this.isProduction()) throw e;
+          conn.status = 'unreachable';
         }
       }
     }
 
-    if (this.isProduction()) throw new Error('Database error retrieving genres');
     return [...this.localDevData.genres];
   }
 
@@ -829,21 +932,22 @@ export class MultiDbManager {
       if (conn.pool && conn.status === 'connected') {
         try {
           const res = await conn.pool.query(`SELECT * FROM tags ORDER BY name ASC`);
-          return res.rows.map(r => ({
-            id: r.id,
-            name: r.name,
-            slug: r.slug,
-            description: r.description,
-            createdAt: r.created_at
-          }));
+          if (res.rows.length > 0) {
+            return res.rows.map(r => ({
+              id: r.id,
+              name: r.name,
+              slug: r.slug,
+              description: r.description,
+              createdAt: r.created_at
+            }));
+          }
         } catch (e) {
           console.error('[MultiDbManager] getTags error:', e);
-          if (this.isProduction()) throw e;
+          conn.status = 'unreachable';
         }
       }
     }
 
-    if (this.isProduction()) throw new Error('Database error retrieving tags');
     return [...this.localDevData.tags];
   }
 
@@ -901,12 +1005,12 @@ export class MultiDbManager {
       if (conn.pool && conn.status === 'connected') {
         try {
           const res = await conn.pool.query(`SELECT data FROM site_settings WHERE id = 'global_settings'`);
-          if (res.rows.length > 0) {
+          if (res.rows.length > 0 && res.rows[0].data) {
             return { ...INITIAL_SETTINGS, ...res.rows[0].data };
           }
         } catch (e) {
           console.error('[MultiDbManager] getSettings error:', e);
-          if (this.isProduction()) throw e;
+          conn.status = 'unreachable';
         }
       }
     }
@@ -954,43 +1058,43 @@ export class MultiDbManager {
             ? `SELECT * FROM popups WHERE active = TRUE ORDER BY priority ASC`
             : `SELECT * FROM popups ORDER BY priority ASC`;
           const res = await conn.pool.query(queryStr);
-          return res.rows.map(r => ({
-            id: r.id,
-            title: r.title,
-            message: r.message,
-            btn1Text: r.btn1_text,
-            btn1Url: r.btn1_url,
-            btn1Enabled: r.btn1_enabled,
-            btn2Text: r.btn2_text,
-            btn2Url: r.btn2_url,
-            btn2Enabled: r.btn2_enabled,
-            bgImageUrl: r.bg_image_url,
-            type: r.type,
-            position: r.position,
-            frequency: r.frequency,
-            delaySeconds: r.delay_seconds,
-            showOn: r.show_on,
-            pagePaths: r.page_paths,
-            startDate: r.start_date,
-            endDate: r.end_date,
-            active: r.active,
-            priority: r.priority,
-            showCloseBtn: r.show_close_btn,
-            showOverlay: r.show_overlay,
-            closeOnOverlay: r.close_on_overlay,
-            cooldownEnabled: r.cooldown_enabled,
-            cooldownHours: r.cooldown_hours,
-            createdAt: r.created_at,
-            updatedAt: r.updated_at
-          }));
+          if (res.rows.length > 0) {
+            return res.rows.map(r => ({
+              id: r.id,
+              title: r.title,
+              message: r.message,
+              btn1Text: r.btn1_text,
+              btn1Url: r.btn1_url,
+              btn1Enabled: r.btn1_enabled,
+              btn2Text: r.btn2_text,
+              btn2Url: r.btn2_url,
+              btn2Enabled: r.btn2_enabled,
+              bgImageUrl: r.bg_image_url,
+              type: r.type,
+              position: r.position,
+              frequency: r.frequency,
+              delaySeconds: r.delay_seconds,
+              showOn: r.show_on,
+              pagePaths: r.page_paths,
+              startDate: r.start_date,
+              endDate: r.end_date,
+              active: r.active,
+              priority: r.priority,
+              showCloseBtn: r.show_close_btn,
+              showOverlay: r.show_overlay,
+              closeOnOverlay: r.close_on_overlay,
+              cooldownEnabled: r.cooldown_enabled,
+              cooldownHours: r.cooldown_hours,
+              createdAt: r.created_at,
+              updatedAt: r.updated_at
+            }));
+          }
         } catch (e) {
           console.error('[MultiDbManager] getPopups error:', e);
-          if (this.isProduction()) throw e;
+          conn.status = 'unreachable';
         }
       }
     }
-
-    if (this.isProduction()) throw new Error('Database error retrieving popups');
 
     let list = [...this.localDevData.popups];
     if (activeOnly) {
@@ -1148,8 +1252,8 @@ export class MultiDbManager {
     }
 
     // 2. Check environment credentials (ADMIN_EMAIL, ADMIN_PASSWORD)
-    const adminEmail = (env.ADMIN_EMAIL || (typeof process !== 'undefined' ? process.env?.ADMIN_EMAIL : ''))?.trim().toLowerCase();
-    const adminPassword = (env.ADMIN_PASSWORD || (typeof process !== 'undefined' ? process.env?.ADMIN_PASSWORD : ''))?.trim();
+    const adminEmail = (env.ADMIN_EMAIL || '')?.trim().toLowerCase();
+    const adminPassword = (env.ADMIN_PASSWORD || '')?.trim();
 
     if (adminEmail && adminPassword && cleanEmail === adminEmail) {
       if (passwordPlain === adminPassword) {
