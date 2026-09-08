@@ -26,10 +26,7 @@ function getBearerToken(req: ApiRequest): string | null {
 }
 
 function getJwtSecret(env: Record<string, any> = {}): string {
-  return (
-    env.JWT_SECRET ||
-    'skxmovies_default_secret_key_change_in_production'
-  );
+  return (env.JWT_SECRET || '')?.trim();
 }
 
 async function checkAdminAuth(req: ApiRequest, env: Record<string, any>): Promise<TokenPayload | null> {
@@ -47,9 +44,10 @@ export async function handleApiRequest(req: ApiRequest, env: Record<string, any>
     console.error('[API Router] multiDb.init() error:', err);
   });
 
-  const method = req.method.toUpperCase();
-  const rawPath = req.path.replace(/^\/api/, '');
-  const path = rawPath.endsWith('/') && rawPath.length > 1 ? rawPath.slice(0, -1) : rawPath;
+  const method = (req.method || 'GET').toUpperCase();
+  const fullPath = req.path || ((req as any).url ? new URL((req as any).url).pathname : '');
+  const rawPath = fullPath.replace(/^\/api/, '');
+  const path = rawPath.endsWith('/') && rawPath.length > 1 ? rawPath.slice(0, -1) : (rawPath || '/');
 
   // 1. Health check
   if (path === '/health' && method === 'GET') {
@@ -126,6 +124,9 @@ export async function handleApiRequest(req: ApiRequest, env: Record<string, any>
       return { status: 400, body: { error: 'Email and password required' } };
     }
     const secret = getJwtSecret(env);
+    if (!secret) {
+      return { status: 500, body: { error: 'JWT_SECRET environment variable is not configured on Cloudflare.' } };
+    }
     const admin = await multiDb.verifyAdmin(email, password, env);
     if (!admin) {
       return { status: 401, body: { error: 'Invalid admin credentials' } };

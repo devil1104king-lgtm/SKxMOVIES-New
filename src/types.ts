@@ -320,8 +320,10 @@ export interface SearchFilterParams {
   query?: string;
   search?: string;
   category?: string;
+  categoryId?: string;
   categorySlug?: string;
   genre?: string;
+  genreId?: string;
   genreSlug?: string;
   tag?: string;
   year?: string;
@@ -329,7 +331,7 @@ export interface SearchFilterParams {
   featured?: boolean;
   page?: number;
   limit?: number;
-  sortBy?: 'createdAt' | 'views' | 'title' | 'releaseDate';
+  sortBy?: 'createdAt' | 'views' | 'title' | 'releaseDate' | 'rating';
   sortOrder?: 'asc' | 'desc';
 }
 

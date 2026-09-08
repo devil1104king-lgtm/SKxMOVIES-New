@@ -17,7 +17,7 @@ async function startServer() {
   app.use(express.json());
 
   // Universal API route handler forwarding to functions/api-router
-  app.all('/api/*', async (req: Request, res: Response) => {
+  app.all(['/api', '/api/*'], async (req: Request, res: Response) => {
     const query: Record<string, string> = {};
     for (const [k, v] of Object.entries(req.query)) {
       if (typeof v === 'string') query[k] = v;
